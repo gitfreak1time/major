@@ -234907,7 +234907,6 @@ const LS_MAPPINGS = "msc_mappings";
 const LS_DEFCACHE = "msc_defcache";
 const LS_NOUNSONLY = "msc_nouns_only";
 const MAX_COMBOS = 500;
-const DEF_CONCURRENCY = 4;
 const DEF_CACHE_LIMIT = 4000;
 
 /* ---------- State ---------- */
@@ -235166,8 +235165,12 @@ async function fetchDefinition(word) {
           if (noun && noun !== first) result.nd = noun.definitions[0].definition;
         }
       }
+    } else if (resp.status === 429) {
+      // Rate limited: tell the queue how long the API asked us to wait
+      const ra = parseInt(resp.headers.get("retry-after"), 10);
+      return { __rl: (!isNaN(ra) && ra > 0 ? Math.min(ra, 120) : 15) * 1000 };
     } else if (resp.status !== 404) {
-      return undefined; // server/rate-limit error: don't cache, may succeed later
+      return undefined; // server error: don't cache, may succeed later
     }
   } catch (e) {
     return undefined;   // network error / timeout: don't cache
@@ -235217,28 +235220,93 @@ function applyNounFilter() {
   }
 }
 
-function lookupDefinitions(items, gen) {
-  // items: [{word, el, entryEl, isDict, isNoun, result}]
-  let cursor = 0;
-  let dirty = false;
-  async function worker() {
-    while (cursor < items.length && gen === generation) {
-      const item = items[cursor++];
-      const r = await fetchDefinition(item.word);
-      if (gen !== generation) return;
-      item.result = r;
-      if (r !== undefined) {
-        // 0 (no definition found) means we can't confirm a noun sense
-        item.isNoun = r === 0 ? false : !!r.nf;
-        dirty = true;
-      }
-      renderDef(item);
-      if (item.isDict) applyNounFilter();
+/* ---------- Definition lookup queue ----------
+   Definitions load lazily: an entry's definition is only requested once it
+   scrolls near the viewport (collapsed sections never fetch at all). Requests
+   are spaced out, and 429 rate-limit responses pause the queue and retry,
+   which keeps large result sets within dictionaryapi.dev's limits. */
+const REQ_SPACING = 300;   // ms between dispatched requests
+const MAX_ATTEMPTS = 4;    // per word, across rate-limit retries
+let defQueue = [];
+let pumping = false;
+let pauseUntil = 0;
+let defObserver = null;
+let saveTimer = null;
+
+function scheduleDefCacheSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveDefCache, 1500);
+}
+
+function resetDefinitionQueue() {
+  defQueue = [];
+  if (defObserver) { defObserver.disconnect(); defObserver = null; }
+}
+
+function enqueueDefinition(item) {
+  defQueue.push(item);
+  pumpDefinitions();
+}
+
+function pumpDefinitions() {
+  if (pumping) return;
+  pumping = true;
+  (function loop() {
+    if (!defQueue.length) { pumping = false; return; }
+    const wait = pauseUntil - Date.now();
+    if (wait > 0) { setTimeout(loop, wait); return; }
+    const item = defQueue.shift();
+    if (item.gen !== generation) { loop(); return; }  // stale render, drop
+    processDefinition(item);                          // async; don't await
+    setTimeout(loop, REQ_SPACING);
+  })();
+}
+
+async function processDefinition(item) {
+  const r = await fetchDefinition(item.word);
+  if (item.gen !== generation) return;
+  if (r && r.__rl) {
+    item.attempts = (item.attempts || 0) + 1;
+    if (item.attempts < MAX_ATTEMPTS) {
+      pauseUntil = Math.max(pauseUntil, Date.now() + r.__rl);
+      item.el.textContent = "(Dictionary service is busy \u2014 retrying shortly\u2026)";
+      defQueue.push(item);   // retry after the pause
+      pumpDefinitions();
+    } else {
+      item.result = undefined;
+      item.el.textContent = "(Definition unavailable \u2014 dictionary service is busy, try again later)";
+      item.el.classList.remove("pending");
     }
+    return;
   }
-  const workers = [];
-  for (let k = 0; k < DEF_CONCURRENCY; k++) workers.push(worker());
-  Promise.all(workers).then(() => { if (dirty) saveDefCache(); });
+  item.result = r;
+  if (r !== undefined) {
+    // 0 (no definition found) means we can't confirm a noun sense
+    item.isNoun = r === 0 ? false : !!r.nf;
+    scheduleDefCacheSave();
+  }
+  renderDef(item);
+  if (item.isDict) applyNounFilter();
+}
+
+function lookupDefinitions(items, gen) {
+  for (const item of items) item.gen = gen;
+  if (typeof IntersectionObserver === "undefined") {
+    // No observer support: fetch everything, still spaced and retried
+    for (const item of items) enqueueDefinition(item);
+    return;
+  }
+  const byEl = new Map();
+  for (const item of items) byEl.set(item.entryEl, item);
+  defObserver = new IntersectionObserver(entries => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      defObserver.unobserve(e.target);
+      const item = byEl.get(e.target);
+      if (item && item.gen === generation) enqueueDefinition(item);
+    }
+  }, { rootMargin: "400px 0px" }); // start loading a little before it's visible
+  for (const item of items) defObserver.observe(item.entryEl);
 }
 
 /* ---------- Rendering helpers ---------- */
@@ -235469,6 +235537,7 @@ function renderNumberConversion(numbers) {
   if (indexBuilding) return; // status already shows progress; rerun lands after build
 
   generation++;
+  resetDefinitionQueue();
   const gen = generation;
   lastWordConversion = null; // results now show a number search, not a word conversion
   lastNumberConversion = numbers;
@@ -235566,6 +235635,7 @@ function toNumbers() {
 function renderWordConversion(input) {
   resultsEl.innerHTML = "";
   generation++; // cancel any in-flight definition lookups
+  resetDefinitionQueue();
   dictSections = [];
   lastWordConversion = null;
   lastNumberConversion = null;
