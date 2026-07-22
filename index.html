@@ -235137,7 +235137,7 @@ async function fetchDefinition(word) {
   let result = 0;
   try {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const timer = setTimeout(() => ctrl.abort(), 9000); // the API is often slow under load
     const resp = await fetch("https://api.dictionaryapi.dev/api/v2/entries/en/" + encodeURIComponent(word), { signal: ctrl.signal });
     clearTimeout(timer);
     if (resp.ok) {
@@ -235186,7 +235186,7 @@ function renderDef(item) {
   const r = item.result;
   if (r === null) return; // still pending
   if (r === undefined) {
-    item.el.textContent = "(Definition unavailable \u2014 check connection)";
+    item.el.textContent = "(Definition unavailable \u2014 the dictionary service is busy or offline; convert again to retry)";
   } else if (r === 0) {
     item.el.textContent = "(Likely a proper noun or name - no definition available)";
   } else if (nounsOnlyOn() && r.nd) {
@@ -235225,13 +235225,15 @@ function applyNounFilter() {
    scrolls near the viewport (collapsed sections never fetch at all). Requests
    are spaced out, and 429 rate-limit responses pause the queue and retry,
    which keeps large result sets within dictionaryapi.dev's limits. */
-const REQ_SPACING = 300;   // ms between dispatched requests
-const MAX_ATTEMPTS = 4;    // per word, across rate-limit retries
+const REQ_SPACING = 300;    // ms between dispatched requests
+const MAX_ATTEMPTS = 4;     // per word, across retries
+const NET_RETRY_BASE = 2500; // backoff base for network-ish failures
 let defQueue = [];
 let pumping = false;
 let pauseUntil = 0;
 let defObserver = null;
 let saveTimer = null;
+let consecFails = 0;        // consecutive failures across the queue
 
 function scheduleDefCacheSave() {
   clearTimeout(saveTimer);
@@ -235265,26 +235267,37 @@ function pumpDefinitions() {
 async function processDefinition(item) {
   const r = await fetchDefinition(item.word);
   if (item.gen !== generation) return;
-  if (r && r.__rl) {
+
+  // Retryable failures. Note: when this API rate-limits, its responses often
+  // lack CORS headers, so the browser reports a plain network error — we
+  // can't tell a 429 from a dropped connection. Treat both as "try again".
+  const rateLimited = r && r.__rl;
+  if (r === undefined || rateLimited) {
     item.attempts = (item.attempts || 0) + 1;
+    consecFails++;
     if (item.attempts < MAX_ATTEMPTS) {
-      pauseUntil = Math.max(pauseUntil, Date.now() + r.__rl);
-      item.el.textContent = "(Dictionary service is busy \u2014 retrying shortly\u2026)";
+      const wait = rateLimited ? r.__rl
+        : Math.min(NET_RETRY_BASE * Math.pow(2, item.attempts - 1), 20000);
+      // Pause the whole queue when we know we're limited, or when several
+      // requests in a row have failed (invisible rate limiting looks like this)
+      if (rateLimited || consecFails >= 3) {
+        pauseUntil = Math.max(pauseUntil, Date.now() + wait);
+      }
+      item.el.textContent = "(Dictionary service is slow \u2014 retrying\u2026)";
       defQueue.push(item);   // retry after the pause
       pumpDefinitions();
     } else {
       item.result = undefined;
-      item.el.textContent = "(Definition unavailable \u2014 dictionary service is busy, try again later)";
-      item.el.classList.remove("pending");
+      renderDef(item);
     }
     return;
   }
+
+  consecFails = 0;
   item.result = r;
-  if (r !== undefined) {
-    // 0 (no definition found) means we can't confirm a noun sense
-    item.isNoun = r === 0 ? false : !!r.nf;
-    scheduleDefCacheSave();
-  }
+  // 0 (no definition found) means we can't confirm a noun sense
+  item.isNoun = r === 0 ? false : !!r.nf;
+  scheduleDefCacheSave();
   renderDef(item);
   if (item.isDict) applyNounFilter();
 }
