@@ -50,6 +50,12 @@
     margin: 0;
   }
   .subtitle { color: var(--muted); font-size: 13px; margin: 2px 0 18px; }
+  .version {
+    font: 600 11px var(--mono);
+    color: var(--muted);
+    letter-spacing: .05em;
+    margin-top: 2px;
+  }
   #settingsBtn {
     flex: none;
     font: 500 14px var(--sans);
@@ -351,7 +357,10 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Major System Converter</h1>
+    <div>
+      <h1>Major System Converter</h1>
+      <div class="version" id="versionLabel"></div>
+    </div>
     <button id="settingsBtn" type="button">&#9881; Settings</button>
   </header>
   <p class="subtitle">Numbers &harr; words, the mnemonic way. Click any digit tile to edit its sounds.</p>
@@ -234889,6 +234898,8 @@ Zyzzogeton</script>
    network use is the free dictionaryapi.dev definitions API.
    ========================================================= */
 
+const VERSION = "7"; // bump on each release; shown under the title
+
 const DEFAULT_MAPPINGS = {
   "0": "s, z, c",
   "1": "t, d, th",
@@ -235828,6 +235839,7 @@ updateDigitToSounds();
 loadWordList();
 renderTiles();
 renderFavorites();
+document.getElementById("versionLabel").textContent = "V." + VERSION;
 setStatus("Ready \u00b7 " + words.length.toLocaleString() + " words loaded \u00b7 definitions fetched online when available");
 </script>
 </body>
